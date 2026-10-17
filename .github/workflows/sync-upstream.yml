@@ -2,13 +2,11 @@ name: Sync upstream
 
 # Keeps this fork close to KeygraphHQ/shannon.
 #
-# `main` carries exactly one local commit: this workflow file. Everything else on it is
-# upstream, so a daily rebase onto `upstream/main` stays a one-commit replay and conflicts are
-# effectively impossible unless upstream ships a file with the same name.
-#
-# The patch branch sits on top of `main`. It is rebased after `main` moves; when that rebase
-# cannot apply cleanly an issue is opened (or the standing one commented) and the run fails,
-# which is the notification.
+# `main` carries the upstream history plus two local commits: this workflow file and the
+# non-ASCII blob-read fix. Every run replays those onto the new `upstream/main`, which is
+# clean whenever upstream has not touched the same files. When upstream does, the rebase
+# stops, an issue is opened (or the standing one commented) and the run fails - that is the
+# notification, and it is the one case that needs a human.
 #
 # This file lives on `main` because GitHub only registers `schedule` and `workflow_dispatch`
 # workflows from the default branch.
@@ -30,7 +28,6 @@ concurrency:
 
 env:
   UPSTREAM: https://github.com/KeygraphHQ/shannon.git
-  PATCH_BRANCH: fix/non-ascii-blob-read
 
 jobs:
   sync:
@@ -53,57 +50,40 @@ jobs:
           git fetch upstream main
 
       - name: Rebase main onto upstream
-        id: main-sync
+        id: sync
         continue-on-error: true
         run: |
           git checkout main
           git rebase upstream/main
 
       - name: Push main
-        if: steps.main-sync.outcome == 'success'
+        if: steps.sync.outcome == 'success'
         run: |
           git push --force-with-lease origin main
           echo "main rebased onto \`$(git rev-parse --short upstream/main)\`." >> "$GITHUB_STEP_SUMMARY"
 
-      - name: Rebase the patch branch onto main
-        if: steps.main-sync.outcome == 'success'
-        id: patch-sync
-        continue-on-error: true
-        run: |
-          git checkout "$PATCH_BRANCH"
-          git rebase main
-
-      - name: Push the patch branch
-        if: steps.patch-sync.outcome == 'success'
-        run: |
-          git push --force-with-lease origin "$PATCH_BRANCH"
-          echo "Patch branch rebased cleanly." >> "$GITHUB_STEP_SUMMARY"
-
       - name: Report the conflict as an issue
-        if: steps.main-sync.outcome == 'failure' || steps.patch-sync.outcome == 'failure'
+        if: steps.sync.outcome == 'failure'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
+          CONFLICTS=$(git diff --name-only --diff-filter=U | tr '\n' ' ')
           git rebase --abort || true
-          if [ "${{ steps.main-sync.outcome }}" = "failure" ]; then
-            FAILED_REF=main
-          else
-            FAILED_REF="$PATCH_BRANCH"
-          fi
           BODY=$(cat <<EOF
-          The scheduled upstream sync could not rebase \`${FAILED_REF}\` onto upstream.
+          The scheduled upstream sync could not rebase \`main\` onto \`upstream/main\`.
 
           Run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
           Upstream commit: \`$(git rev-parse --short upstream/main)\`
+          Files in conflict: ${CONFLICTS:-unknown}
 
           Resolve locally:
 
           \`\`\`bash
           git fetch upstream main
-          git checkout ${FAILED_REF}
+          git checkout main
           git rebase upstream/main
           # resolve, then:
-          git push --force-with-lease origin ${FAILED_REF}
+          git push --force-with-lease origin main
           \`\`\`
           EOF
           )
@@ -113,7 +93,7 @@ jobs:
           if [ -n "$EXISTING" ]; then
             gh issue comment "$EXISTING" --body "$BODY"
           else
-            gh issue create --title "Upstream sync conflict: ${FAILED_REF} needs a manual rebase" --body "$BODY"
+            gh issue create --title "Upstream sync conflict: main needs a manual rebase" --body "$BODY"
           fi
-          echo "Rebase conflict on ${FAILED_REF} reported." >> "$GITHUB_STEP_SUMMARY"
+          echo "Rebase conflict reported." >> "$GITHUB_STEP_SUMMARY"
           exit 1
