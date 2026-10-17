@@ -1,0 +1,119 @@
+name: Sync upstream
+
+# Keeps this fork close to KeygraphHQ/shannon.
+#
+# `main` carries exactly one local commit: this workflow file. Everything else on it is
+# upstream, so a daily rebase onto `upstream/main` stays a one-commit replay and conflicts are
+# effectively impossible unless upstream ships a file with the same name.
+#
+# The patch branch sits on top of `main`. It is rebased after `main` moves; when that rebase
+# cannot apply cleanly an issue is opened (or the standing one commented) and the run fails,
+# which is the notification.
+#
+# This file lives on `main` because GitHub only registers `schedule` and `workflow_dispatch`
+# workflows from the default branch.
+
+on:
+  schedule:
+    # Daily at 03:17 UTC. Off the hour and off :30 so this does not pile onto the fleet's
+    # other scheduled jobs.
+    - cron: '17 3 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  issues: write
+
+concurrency:
+  group: sync-upstream
+  cancel-in-progress: false
+
+env:
+  UPSTREAM: https://github.com/KeygraphHQ/shannon.git
+  PATCH_BRANCH: fix/non-ascii-blob-read
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out the fork with full history
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Configure git identity
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+
+      - name: Fetch upstream
+        run: |
+          git remote add upstream "$UPSTREAM"
+          git fetch upstream main
+
+      - name: Rebase main onto upstream
+        id: main-sync
+        continue-on-error: true
+        run: |
+          git checkout main
+          git rebase upstream/main
+
+      - name: Push main
+        if: steps.main-sync.outcome == 'success'
+        run: |
+          git push --force-with-lease origin main
+          echo "main rebased onto \`$(git rev-parse --short upstream/main)\`." >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Rebase the patch branch onto main
+        if: steps.main-sync.outcome == 'success'
+        id: patch-sync
+        continue-on-error: true
+        run: |
+          git checkout "$PATCH_BRANCH"
+          git rebase main
+
+      - name: Push the patch branch
+        if: steps.patch-sync.outcome == 'success'
+        run: |
+          git push --force-with-lease origin "$PATCH_BRANCH"
+          echo "Patch branch rebased cleanly." >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Report the conflict as an issue
+        if: steps.main-sync.outcome == 'failure' || steps.patch-sync.outcome == 'failure'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          git rebase --abort || true
+          if [ "${{ steps.main-sync.outcome }}" = "failure" ]; then
+            FAILED_REF=main
+          else
+            FAILED_REF="$PATCH_BRANCH"
+          fi
+          BODY=$(cat <<EOF
+          The scheduled upstream sync could not rebase \`${FAILED_REF}\` onto upstream.
+
+          Run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          Upstream commit: \`$(git rev-parse --short upstream/main)\`
+
+          Resolve locally:
+
+          \`\`\`bash
+          git fetch upstream main
+          git checkout ${FAILED_REF}
+          git rebase upstream/main
+          # resolve, then:
+          git push --force-with-lease origin ${FAILED_REF}
+          \`\`\`
+          EOF
+          )
+          # One open issue at a time: reuse the standing one so a persistent conflict does not
+          # file a new issue every day.
+          EXISTING=$(gh issue list --state open --search 'upstream sync conflict in:title' --json number --jq '.[0].number')
+          if [ -n "$EXISTING" ]; then
+            gh issue comment "$EXISTING" --body "$BODY"
+          else
+            gh issue create --title "Upstream sync conflict: ${FAILED_REF} needs a manual rebase" --body "$BODY"
+          fi
+          echo "Rebase conflict on ${FAILED_REF} reported." >> "$GITHUB_STEP_SUMMARY"
+          exit 1
