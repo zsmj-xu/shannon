@@ -5,6 +5,7 @@
 // as published by the Free Software Foundation.
 
 import { AsyncLocalStorage } from 'node:async_hooks';
+import { spawn } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { $ } from 'zx';
 import type { ActivityLogger } from '../types/activity-logger.js';
@@ -545,10 +546,39 @@ export async function isAncestor(ancestor: string, descendant: string, sourceDir
   });
 }
 
+/**
+ * Run Git and return stdout as text decoded in a single pass over the raw bytes.
+ *
+ * `zx`'s string stdout decodes each internal read chunk on its own, so a multi-byte UTF-8
+ * character straddling a chunk boundary comes back as U+FFFD and the text stops matching the
+ * bytes Git holds. Blob reads must not go through it: collecting the chunks and decoding once
+ * is exact for any payload, which is what the caller's byte-for-byte verification depends on.
+ */
+export async function execGitBuffered(
+  sourceDir: string,
+  args: readonly string[],
+): Promise<{ exitCode: number; stdout: string; stderr: string }> {
+  return new Promise((resolve) => {
+    const child = spawn('git', [...args], { cwd: sourceDir });
+    const out: Buffer[] = [];
+    const err: Buffer[] = [];
+    child.stdout.on('data', (chunk: Buffer) => out.push(chunk));
+    child.stderr.on('data', (chunk: Buffer) => err.push(chunk));
+    child.on('error', () => resolve({ exitCode: 1, stdout: '', stderr: '' }));
+    child.on('close', (code) =>
+      resolve({
+        exitCode: code ?? 1,
+        stdout: Buffer.concat(out).toString('utf8'),
+        stderr: Buffer.concat(err).toString('utf8'),
+      }),
+    );
+  });
+}
+
 /** Read a file from `HEAD`, returning null only when the Git command cannot supply it. */
 export async function readFileFromHead(sourceDir: string, relPath: string): Promise<string | null> {
   return withGitRepoLock(async () => {
-    const result = await $`cd ${sourceDir} && git show ${`HEAD:${relPath}`}`.nothrow().quiet();
+    const result = await execGitBuffered(sourceDir, ['show', `HEAD:${relPath}`]);
     return result.exitCode === 0 ? result.stdout : null;
   });
 }
@@ -610,7 +640,7 @@ function transientHeadReadError(operation: string): PentestError {
  */
 export async function readCommittedFile(sourceDir: string, relPath: string): Promise<CommittedReadResult> {
   return withGitRepoLock(async () => {
-    const result = await $`cd ${sourceDir} && git show ${`HEAD:${relPath}`}`.nothrow().quiet();
+    const result = await execGitBuffered(sourceDir, ['show', `HEAD:${relPath}`]);
     if (result.exitCode === 0) {
       return { state: 'present', contents: result.stdout };
     }

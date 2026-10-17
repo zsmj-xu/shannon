@@ -78,7 +78,9 @@ RUN apk update && apk add --no-cache \
     # Font rendering
     fontconfig
 
-# Install Typst (report PDF compilation)
+# Install Typst (report PDF compilation).
+# Bounded and non-fatal: PDF compilation is best-effort in the worker, so a slow or
+# unreachable GitHub release host must never fail the image build.
 ARG TYPST_VERSION=0.14.2
 RUN case "$(uname -m)" in \
       x86_64) TYPST_ARCH=x86_64-unknown-linux-musl ;; \
@@ -86,13 +88,15 @@ RUN case "$(uname -m)" in \
       *) echo "unsupported arch $(uname -m)" && exit 1 ;; \
     esac && \
     mkdir -p /tmp/typst-dl /usr/local/bin && cd /tmp/typst-dl && \
-    curl -fsSL "https://github.com/typst/typst/releases/download/v${TYPST_VERSION}/typst-${TYPST_ARCH}.tar.xz" -o typst.tar.xz && \
-    xz -d typst.tar.xz && \
-    tar -xf typst.tar && \
-    mv "typst-${TYPST_ARCH}/typst" /usr/local/bin/typst && \
-    chmod +x /usr/local/bin/typst && \
-    cd / && rm -rf /tmp/typst-dl && \
-    typst --version
+    ( curl -fsSL --connect-timeout 20 --max-time 300 --retry 2 --retry-delay 5 \
+        "https://github.com/typst/typst/releases/download/v${TYPST_VERSION}/typst-${TYPST_ARCH}.tar.xz" -o typst.tar.xz \
+      && xz -d typst.tar.xz \
+      && tar -xf typst.tar \
+      && mv "typst-${TYPST_ARCH}/typst" /usr/local/bin/typst \
+      && chmod +x /usr/local/bin/typst \
+      && typst --version ) \
+    || echo "WARNING: Typst not installed; PDF reports will be skipped and the Markdown report is unaffected." ; \
+    cd / && rm -rf /tmp/typst-dl
 
 # Create non-root user
 RUN addgroup -g 1001 pentest && \
